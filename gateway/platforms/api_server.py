@@ -2308,6 +2308,9 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        user_id: Optional[str] = None,
+        user_id_alt: Optional[str] = None,
+        user_name: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2602,6 +2605,12 @@ class APIServerAdapter(BasePlatformAdapter):
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
         }
+        if user_id is not None:
+            agent_kwargs["user_id"] = user_id
+        if user_id_alt is not None:
+            agent_kwargs["user_id_alt"] = user_id_alt
+        if user_name is not None:
+            agent_kwargs["user_name"] = user_name
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 

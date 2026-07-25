@@ -630,6 +630,7 @@ def _discover(
     limit: int,
     sort: Optional[str],
     current_session_id: str = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
@@ -646,6 +647,7 @@ def _discover(
             # of cron rows are still in hand for the demotion pass below.
             offset=0,
             sort=sort,
+            user_id=user_id,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -782,6 +784,8 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
+    # user_id filters results to a specific user's messages
+    user_id: Optional[str] = None,
     # Scroll shape
     session_id: str = None,
     around_message_id: int = None,
@@ -897,6 +901,7 @@ def session_search(
         limit=limit,
         sort=sort_norm,
         current_session_id=current_session_id,
+        user_id=user_id,
     )
 
 
