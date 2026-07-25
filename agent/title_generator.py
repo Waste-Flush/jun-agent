@@ -58,7 +58,7 @@ def _title_language() -> str:
 def _load_title_state() -> dict:
     """Load title update tracking state from disk."""
     try:
-        with open(_TITLE_STATE_PATH, "r") as f:
+        with open(_TITLE_STATE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
@@ -67,7 +67,7 @@ def _load_title_state() -> dict:
 def _save_title_state(state: dict) -> None:
     """Persist title update tracking state to disk."""
     os.makedirs(os.path.dirname(_TITLE_STATE_PATH), exist_ok=True)
-    with open(_TITLE_STATE_PATH, "w") as f:
+    with open(_TITLE_STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(state, f)
 
 
