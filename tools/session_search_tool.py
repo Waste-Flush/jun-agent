@@ -695,6 +695,7 @@ def _discover(
     sort: Optional[str],
     current_session_id: str = None,
     link_profile: str = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
     role_list = role_filter if role_filter else ["user", "assistant"]
@@ -711,6 +712,7 @@ def _discover(
             # of cron rows are still in hand for the demotion pass below.
             offset=0,
             sort=sort,
+            user_id=user_id,
             fields=_DISCOVER_SEARCH_FIELDS,
         )
     except Exception as e:
@@ -859,6 +861,8 @@ def session_search(
     sort: str = None,
     # Cross-profile (any shape)
     profile: str = None,
+    # user_id filters results to a specific user's messages
+    user_id: Optional[str] = None,
 ) -> str:
     """Single-shape tool. Mode inferred from which args are set.
 
@@ -960,14 +964,15 @@ def session_search(
             sort_norm = candidate
 
     return _discover(
-        db=db,
-        query=query.strip(),
-        role_filter=role_list,
-        limit=limit,
-        sort=sort_norm,
-        current_session_id=current_session_id,
-        link_profile=profile,
-    )
+             db=db,
+             query=query.strip(),
+             role_filter=role_list,
+             limit=limit,
+             sort=sort_norm,
+             current_session_id=current_session_id,
+             link_profile=profile,
+             user_id=user_id,
+         )
 
 
 def check_session_search_requirements() -> bool:

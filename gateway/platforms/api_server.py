@@ -2537,6 +2537,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        user_id: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3517,6 +3518,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3524,6 +3526,11 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
+
+        # Allow caller to identify themselves for per-user memory isolation.
+        user_id = request.headers.get("X-Hermes-User-ID", "").strip() or \
+                  (body.get("user_id") if isinstance(body.get("user_id"), str) else "") or None
+
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
@@ -3593,6 +3600,7 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            user_id=user_id,
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -3647,6 +3655,11 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+
+        # Allow caller to identify themselves for per-user memory isolation.
+        user_id = request.headers.get("X-Hermes-User-ID", "").strip() or \
+                  (body.get("user_id") if isinstance(body.get("user_id"), str) else "") or None
+
         # Runtime selection — mirrors _handle_session_chat (lock wins,
         # otherwise session-persisted model then per-request values).
         runtime_request = self._effective_session_runtime_request(
@@ -3758,6 +3771,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    user_id=user_id,
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -3949,6 +3963,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
+        # Allow caller to identify themselves for per-user memory isolation.
+        # Extracted from X-Hermes-User-ID header or body parameter.
+        user_id = request.headers.get("X-Hermes-User-ID", "").strip() or \
+                  (body.get("user_id") if isinstance(body.get("user_id"), str) else "") or None
+
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
         #
@@ -4114,6 +4133,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                user_id=user_id,
                 **agent_overrides,
                 route=route,
             ))
@@ -5974,6 +5994,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        user_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6031,6 +6052,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        user_id=user_id,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent

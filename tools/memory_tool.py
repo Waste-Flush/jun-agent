@@ -162,11 +162,12 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, user_id: Optional[str] = None):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.user_id = user_id  # When set, routes user memory to {user_id}.md
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         # Per-turn counter of failed at-capacity consolidation attempts; reset
@@ -221,7 +222,8 @@ class MemoryStore:
         mem_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        user_file = f"{self.user_id}.md" if self.user_id else "USER.md"
+        self.user_entries = self._read_file(mem_dir / user_file)
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -231,7 +233,7 @@ class MemoryStore:
         # (memory_entries / user_entries) keeps the raw text so the user
         # can see + remove poisoned entries via the memory tool.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
-        sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
+        sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, user_file)
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
@@ -313,8 +315,10 @@ class MemoryStore:
             fd.close()
 
     @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(target: str, user_id: Optional[str] = None) -> Path:
         mem_dir = get_memory_dir()
+        if target == "user" and user_id:
+            return mem_dir / f"{user_id}.md"
         if target == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
@@ -342,7 +346,7 @@ class MemoryStore:
         bypassed.  Used by the ``add`` action which appends without
         rewriting, so existing content is never clobbered.
         """
-        path = self._path_for(target)
+        path = self._path_for(target, self.user_id)
         raw, read_ok = self._read_raw_checked(path)
         if not read_ok:
             # Leave in-memory entries untouched and tell the caller to abort;
@@ -363,7 +367,7 @@ class MemoryStore:
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        self._write_file(self._path_for(target, self.user_id), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -398,7 +402,7 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        with self._file_lock(self._path_for(target, self.user_id)):
             # Re-read from disk under lock to pick up writes from other sessions.
             # For add (append-only), we skip the drift guard — appending never
             # clobbers existing content, so round-trip mismatches from prior
@@ -412,7 +416,7 @@ class MemoryStore:
             # permission blip, I/O error) would be rewritten down to just the
             # new entry — wiping every prior memory. Refuse instead.
             if self._reload_target(target, skip_drift=True) is _READ_FAILED:
-                return _read_failed_error(self._path_for(target))
+                return _read_failed_error(self._path_for(target, self.user_id))
 
             entries = self._entries_for(target)
             limit = self._char_limit(target)
@@ -460,12 +464,12 @@ class MemoryStore:
         if scan_error:
             return {"success": False, "error": scan_error}
 
-        with self._file_lock(self._path_for(target)):
+        with self._file_lock(self._path_for(target, self.user_id)):
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
-                return _read_failed_error(self._path_for(target))
+                return _read_failed_error(self._path_for(target, self.user_id))
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(self._path_for(target, self.user_id), bak)
 
             entries = self._entries_for(target)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
@@ -523,12 +527,12 @@ class MemoryStore:
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
 
-        with self._file_lock(self._path_for(target)):
+        with self._file_lock(self._path_for(target, self.user_id)):
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
-                return _read_failed_error(self._path_for(target))
+                return _read_failed_error(self._path_for(target, self.user_id))
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(self._path_for(target, self.user_id), bak)
 
             entries = self._entries_for(target)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
@@ -585,12 +589,12 @@ class MemoryStore:
                 if scan_error:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
 
-        with self._file_lock(self._path_for(target)):
+        with self._file_lock(self._path_for(target, self.user_id)):
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
-                return _read_failed_error(self._path_for(target))
+                return _read_failed_error(self._path_for(target, self.user_id))
             if bak:
-                return _drift_error(self._path_for(target), bak)
+                return _drift_error(self._path_for(target, self.user_id), bak)
 
             # Work on a copy; only commit if the whole batch validates.
             working: List[str] = list(self._entries_for(target))
@@ -835,7 +839,7 @@ class MemoryStore:
         Note: this is an INSTANCE method (not static) because we need the
         per-target char_limit for signal #2.
         """
-        path = self._path_for(target)
+        path = self._path_for(target, self.user_id)
         if not raw.strip():
             return None
 
