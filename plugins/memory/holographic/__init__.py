@@ -177,6 +177,7 @@ class HolographicMemoryProvider(MemoryProvider):
             hrr_dim=hrr_dim,
         )
         self._session_id = session_id
+        self._user_id = kwargs.get("user_id")
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -242,6 +243,43 @@ class HolographicMemoryProvider(MemoryProvider):
             return
         self._auto_extract_facts(messages)
 
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Extract durable facts from messages before context compression."""
+        if not self._store or not messages or not self._user_id:
+            return ""
+
+        # Filter out compaction summaries and non-user messages
+        user_msgs = [
+            m for m in messages
+            if m.get("role") == "user"
+            and not self._is_compaction_summary(m)
+            and isinstance(m.get("content"), str)
+        ]
+
+        # Build conversation text (user messages only, >10 chars)
+        conversation_text = "\n".join(
+            m.get("content", "") for m in user_msgs
+            if isinstance(m.get("content"), str) and len(m.get("content", "")) > 10
+        )
+
+        if not conversation_text.strip():
+            return ""
+
+        extracted = self._llm_extract_facts(conversation_text, self._user_id)
+
+        saved = 0
+        for fact in extracted:
+            try:
+                self._store.add_fact(fact, owner_id=self._user_id)
+                saved += 1
+            except Exception:
+                pass  # dedup in add_fact handles duplicates
+
+        if saved:
+            return f"FACTS: {' | '.join(extracted[:5])}"
+
+        return ""
+
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes as facts."""
         if action == "add" and self._store and content:
@@ -279,6 +317,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     args["content"],
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
+                    owner_id=args.get("owner_id"),
                 )
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
@@ -366,7 +405,75 @@ class HolographicMemoryProvider(MemoryProvider):
         except Exception as exc:
             return tool_error(str(exc))
 
-    # -- Auto-extraction (on_session_end) ------------------------------------
+    # -- Auto-extraction (on_pre_compress / on_session_end) -------------------
+
+    def _is_compaction_summary(self, msg: dict) -> bool:
+        """Check if a message is a compaction handoff summary."""
+        from agent.context_compressor import is_compaction_summary_message
+        return is_compaction_summary_message(msg)
+
+    def _llm_extract_facts(self, conversation_text: str, user_id: str) -> list[str]:
+        """Use the auxiliary compression LLM to extract durable facts.
+
+        Returns a deduplicated list of fact strings.
+        """
+        try:
+            from agent.auxiliary_client import call_llm
+        except ImportError:
+            logger.debug("auxiliary_client unavailable, skipping LLM extraction")
+            return []
+
+        prompt = (
+            "Extract all durable facts from this conversation. Return each fact as a "
+            "standalone declarative sentence, one per line. Skip greetings, questions, "
+            "transient chat, and anything about the current task. Focus on: user "
+            "preferences, project decisions, relationships, technical details, lessons "
+            "learned, recurring patterns.\n\n"
+            "Owner: " + user_id + "\n\n"
+            "Conversation:\n" + conversation_text + "\n\n"
+            "Facts:"
+        )
+
+        try:
+            result = call_llm(
+                task="fact_extraction",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                max_tokens=1024,
+                temperature=0.0,
+            )
+            content = None
+            if hasattr(result, "choices") and result.choices:
+                content = result.choices[0].message.content
+            elif isinstance(result, dict) and "choices" in result:
+                content = result["choices"][0]["message"]["content"]
+
+            if not content:
+                return []
+
+            facts = []
+            for line in content.strip().split("\n"):
+                line = line.strip().lstrip("-•*). ")
+                if len(line) > 10 and not line.startswith(("Hey", "Hi", "So,", "Okay", "Alright", "Sure")):
+                    facts.append(line)
+
+            # Dedup
+            seen = set()
+            deduped = []
+            for f in facts:
+                key = f.lower().strip()
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(f)
+            return deduped
+
+        except Exception as e:
+            logger.debug("LLM fact extraction failed: %s", e)
+            return []
 
     def _auto_extract_facts(self, messages: list) -> None:
         # Local import (pattern used in initialize()): the compressor module is

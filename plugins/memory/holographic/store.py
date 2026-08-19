@@ -3,7 +3,6 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
-import os
 import re
 import sqlite3
 import threading
@@ -25,7 +24,8 @@ CREATE TABLE IF NOT EXISTS facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    hrr_vector      BLOB
+    hrr_vector      BLOB,
+    owner_id        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -180,6 +180,8 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        if "owner_id" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN owner_id TEXT")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -191,12 +193,15 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
+        owner_id: str | None = None,
     ) -> int:
         """Insert a fact and return its fact_id.
 
         Deduplicates by content (UNIQUE constraint). On duplicate, returns
         the existing fact_id without modifying the row. Extracts entities from
         the content and links them to the fact.
+
+        owner_id: optional user_id for cross-user isolation.
         """
         with self._lock:
             content = content.strip()
@@ -206,10 +211,10 @@ class MemoryStore:
             try:
                 cur = self._conn.execute(
                     """
-                    INSERT INTO facts (content, category, tags, trust_score)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO facts (content, category, tags, trust_score, owner_id)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
-                    (content, category, tags, self.default_trust),
+                    (content, category, tags, self.default_trust, owner_id),
                 )
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
@@ -237,11 +242,14 @@ class MemoryStore:
         category: str | None = None,
         min_trust: float = 0.3,
         limit: int = 10,
+        owner_id: str | None = None,
     ) -> list[dict]:
         """Full-text search over facts using FTS5.
 
         Returns a list of fact dicts ordered by FTS5 rank, then trust_score
         descending. Also increments retrieval_count for matched facts.
+
+        owner_id: filter to facts belonging to a specific user. None returns all.
         """
         with self._lock:
             query = query.strip()
@@ -260,17 +268,22 @@ class MemoryStore:
             if category is not None:
                 category_clause = "AND f.category = ?"
                 params.append(category)
+            owner_clause = ""
+            if owner_id is not None:
+                owner_clause = "AND f.owner_id = ?"
+                params.append(owner_id)
             params.append(limit)
 
             sql = f"""
                 SELECT f.fact_id, f.content, f.category, f.tags,
                        f.trust_score, f.retrieval_count, f.helpful_count,
-                       f.created_at, f.updated_at
+                       f.created_at, f.updated_at, f.owner_id
                 FROM facts f
                 JOIN facts_fts fts ON fts.rowid = f.fact_id
                 WHERE facts_fts MATCH ?
                   AND f.trust_score >= ?
                   {category_clause}
+                  {owner_clause}
                 ORDER BY fts.rank, f.trust_score DESC
                 LIMIT ?
             """
@@ -375,10 +388,11 @@ class MemoryStore:
         category: str | None = None,
         min_trust: float = 0.0,
         limit: int = 50,
+        owner_id: str | None = None,
     ) -> list[dict]:
         """Browse facts ordered by trust_score descending.
 
-        Optionally filter by category and minimum trust score.
+        Optionally filter by category, minimum trust score, and owner.
         """
         with self._lock:
             params: list = [min_trust]
@@ -386,14 +400,19 @@ class MemoryStore:
             if category is not None:
                 category_clause = "AND category = ?"
                 params.append(category)
+            owner_clause = ""
+            if owner_id is not None:
+                owner_clause = "AND owner_id = ?"
+                params.append(owner_id)
             params.append(limit)
 
             sql = f"""
                 SELECT fact_id, content, category, tags, trust_score,
-                       retrieval_count, helpful_count, created_at, updated_at
+                       retrieval_count, helpful_count, created_at, updated_at, owner_id
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}
+                  {owner_clause}
                 ORDER BY trust_score DESC
                 LIMIT ?
             """
@@ -617,42 +636,6 @@ class MemoryStore:
         """Convert a sqlite3.Row to a plain dict."""
         return dict(row)
 
-    @classmethod
-    def release_all_under(cls, directory: "str | Path") -> int:
-        """Force-close every shared connection whose database lives under ``directory``.
-
-        ``close()`` is refcount-driven, so a live holder (e.g. an agent's
-        memory provider) keeps a profile's SQLite handle open indefinitely.
-        That is exactly what a profile delete must break on Windows: the
-        desktop's main ``serve`` process opens ``memory_store.db`` for every
-        known profile, and ``rmtree`` of the profile directory fails with
-        ``WinError 32`` while any of those handles is open (#88347). This
-        closes the matching connections unconditionally — the directory is
-        going away, so later use by a stale holder is expected to fail — and
-        returns how many were closed. In a process that holds none (e.g. the
-        CLI deleting from outside serve) this is a harmless no-op returning 0.
-        """
-        root = os.path.normcase(str(Path(directory).expanduser().resolve())) + os.sep
-        with cls._shared_guard:
-            # Snapshot the keys first so the registry stays stable while
-            # connections are closed inside their per-database locks (closing
-            # can run no user code, but this keeps the invariant obvious).
-            doomed = [
-                key
-                for key in cls._shared
-                if os.path.normcase(key).startswith(root)
-            ]
-            for key in doomed:
-                entry = cls._shared.pop(key)
-                try:
-                    with entry["lock"]:
-                        entry["conn"].close()
-                except Exception:
-                    # A connection that is already closed or broken must not
-                    # abort releasing its siblings.
-                    pass
-        return len(doomed)
-
     def close(self) -> None:
         """Release this instance's reference to the shared connection.
 
@@ -671,14 +654,7 @@ class MemoryStore:
                 try:
                     entry["conn"].close()
                 finally:
-                    # Pop only OUR entry. After release_all_under() force-
-                    # closed this entry (profile delete, #88347) a same-path
-                    # store may have re-registered a FRESH entry under the
-                    # same key; a stale holder's late close() must not evict
-                    # it — that would silently reintroduce the multi-writer
-                    # contention this registry exists to prevent.
-                    if MemoryStore._shared.get(self._key) is entry:
-                        MemoryStore._shared.pop(self._key, None)
+                    MemoryStore._shared.pop(self._key, None)
             self._entry = None
 
     def __enter__(self) -> "MemoryStore":
