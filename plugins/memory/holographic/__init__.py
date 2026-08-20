@@ -69,6 +69,7 @@ FACT_STORE_SCHEMA = {
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
+            "owner_id": {"type": "string", "description": "Filter/search by owner user_id."},
         },
         "required": ["action"],
     },
@@ -206,7 +207,9 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._retriever or not query:
             return ""
         try:
-            results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
+            results = self._retriever.search(
+                query, min_trust=self._min_trust, limit=5, owner_id=self._user_id
+            )
             if not results:
                 return ""
             lines = []
@@ -285,7 +288,9 @@ class HolographicMemoryProvider(MemoryProvider):
         if action == "add" and self._store and content:
             try:
                 category = "user_pref" if target == "user" else "general"
-                self._store.add_fact(content, category=category)
+                self._store.add_fact(
+                    content, category=category, owner_id=self._user_id
+                )
             except Exception as e:
                 logger.debug("Holographic memory_write mirror failed: %s", e)
 
@@ -327,6 +332,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", self._min_trust)),
                     limit=int(args.get("limit", 10)),
+                    owner_id=args.get("owner_id"),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -335,6 +341,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     args["entity"],
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    owner_id=args.get("owner_id"),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -343,6 +350,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     args["entity"],
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    owner_id=args.get("owner_id"),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -354,6 +362,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     entities,
                     category=args.get("category"),
                     limit=int(args.get("limit", 10)),
+                    owner_id=args.get("owner_id"),
                 )
                 return json.dumps({"results": results, "count": len(results)})
 
@@ -383,6 +392,7 @@ class HolographicMemoryProvider(MemoryProvider):
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", 0.0)),
                     limit=int(args.get("limit", 10)),
+                    owner_id=args.get("owner_id"),
                 )
                 return json.dumps({"facts": facts, "count": len(facts)})
 
@@ -539,7 +549,9 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _PREF_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="user_pref")
+                        self._store.add_fact(
+                            content[:400], category="user_pref", owner_id=self._user_id
+                        )
                         extracted += 1
                     except Exception:
                         pass
@@ -548,7 +560,9 @@ class HolographicMemoryProvider(MemoryProvider):
             for pattern in _DECISION_PATTERNS:
                 if pattern.search(content):
                     try:
-                        self._store.add_fact(content[:400], category="project")
+                        self._store.add_fact(
+                            content[:400], category="project", owner_id=self._user_id
+                        )
                         extracted += 1
                     except Exception:
                         pass
