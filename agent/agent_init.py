@@ -1292,6 +1292,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                     user_char_limit=mem_config.get("user_char_limit", 1375),
                     memory_enabled=agent._memory_enabled,
                     user_profile_enabled=agent._user_profile_enabled,
+                    user_id=agent._user_id,
                 )
                 agent._memory_store.load_from_disk()
 

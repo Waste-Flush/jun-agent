@@ -86,11 +86,13 @@ class MemoryStore:
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375, *,
-                 memory_enabled: bool = True, user_profile_enabled: bool = True):
+                 memory_enabled: bool = True, user_profile_enabled: bool = True,
+                 user_id: Optional[str] = None):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit, self.user_char_limit = memory_char_limit, user_char_limit
         self.memory_enabled, self.user_profile_enabled = memory_enabled, user_profile_enabled
+        self.user_id = user_id  # When set, routes user memory to {user_id}.md
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
         self._consolidation_failures = 0  # per turn; reset by reset_consolidation_failures()
 
@@ -136,7 +138,7 @@ class MemoryStore:
                     f"Removed from system prompt; use memory(action=remove) to delete the original.]")
 
         for target in ("memory", "user"):
-            path = self._path_for(target)
+            path = self._path_for(target, self.user_id)
             from hermes_constants import mkdir_under_hermes_home
 
             mkdir_under_hermes_home(path.parent)
@@ -150,7 +152,9 @@ class MemoryStore:
                 logger.warning("%s exceeds its char limit on load: %d/%d chars. Entries stay loaded; "
                                "further additions are blocked until it is back under the limit.",
                                path.name, count, limit)
-            self._system_prompt_snapshot[target] = self._render_block(target, [_sanitize(e, path.name) for e in entries])
+            # When user_id is set, render the block with the user-specific filename for sanitization
+            filename = f"{self.user_id}.md" if (target == "user" and self.user_id) else path.name
+            self._system_prompt_snapshot[target] = self._render_block(target, [_sanitize(e, filename) for e in entries])
 
     @staticmethod
     @contextmanager
@@ -196,8 +200,10 @@ class MemoryStore:
                     _flock(True)
 
     @staticmethod
-    def _path_for(target: str) -> Path:
+    def _path_for(target: str, user_id: Optional[str] = None) -> Path:
         from tools import memory_tool  # get_memory_dir is monkeypatched there
+        if target == "user" and user_id:
+            return memory_tool.get_memory_dir() / f"{user_id}.md"
         return memory_tool.get_memory_dir() / ("USER.md" if target == "user" else "MEMORY.md")
 
     def _entries_for(self, target: str) -> List[str]:
@@ -240,7 +246,7 @@ class MemoryStore:
         a failed second read used to count as "no drift". The closure may return a
         third value, a dict merged into the success payload (``_error``'s ``**extra``
         convention) — e.g. the full text a replace overwrote (#117952)."""
-        path = self._path_for(target)
+        path = self._path_for(target, self.user_id)
         with self._file_lock(path):
             raw, read_ok = self._read_raw_checked(path)
             if not read_ok:
@@ -384,7 +390,7 @@ class MemoryStore:
                 # #103419: a consolidation batch that removes the last entry would
                 # commit an empty file as a normal successful write. Refuse; single
                 # remove() is the deliberate-wipe path.
-                label = self._path_for(target).name
+                label = self._path_for(target, self.user_id).name
                 return self._batch_failure(target, (
                     f"Refusing to empty {label}: this batch would remove every entry from a "
                     f"previously non-empty store. Keep at least one entry — merge overlapping "
@@ -474,7 +480,7 @@ class MemoryStore:
         if not raw.strip() or (raw.strip() == ENTRY_DELIMITER.join(parsed)
                                and max(map(len, parsed), default=0) <= self._char_limit(target)):
             return None
-        path = self._path_for(target)
+        path = self._path_for(target, self.user_id)
         bak_path = path.with_suffix(path.suffix + f".bak.{int(time.time())}")
         try:
             bak_path.write_text(raw, encoding="utf-8")

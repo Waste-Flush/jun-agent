@@ -3,7 +3,8 @@
 Two stages, both off the critical path: an **instant** deterministic title (written before the model
 is called, cannot fail), then an **upgrade** from one small-model call (cheap tier, thinking off,
 JSON-constrained). Storage enforces provenance ``derived < llm < user``: stage 2 only replaces stage 1
-and neither replaces a name the user typed."""
+and neither replaces a name the user typed.
+"""
 
 import json
 import logging
@@ -92,7 +93,6 @@ _EXAMPLE_ECHO_REJECT = frozenset(
 # detectable, an improvised one ("Casual check-in chat") would lock the title as ``llm``.
 _PROVISIONAL_GREETING_TITLE = "friendly greeting"
 
-
 _TITLE_PROMPT_TEMPLATE = (
     "You name chat sessions. Given the user's opening message, write a title "
     "that lets them find this conversation again in a list.\n\n"
@@ -107,9 +107,9 @@ _TITLE_PROMPT_TEMPLATE = (
     "__LANGUAGE_RULE__\n"
     + "".join(f'Good: {{"title": "{t}"}}\n' for t in _PROMPT_GOOD_EXAMPLES)
     + f'Too vague: {{"title": "{_PROMPT_VAGUE_EXAMPLE}"}}\n'
-    'Too long: {"title": "Investigate and fix the issue where the login button '
-    'does not respond on mobile devices"}\n\n'
-    'Reply with JSON only: {"title": "..."}'
+    'Too long: {{"title": "Investigate and fix the issue where the login button '
+    'does not respond on mobile devices"}}\n\n'
+    'Reply with JSON only: {{"title": "..."}}'
 )
 
 _LANGUAGE_RULE_MATCH_USER = "- Write the title in the same language as the user's message."
@@ -142,6 +142,9 @@ _MACHINE_PREFIXES = (
     # question.
     "[System: The active model for this chat has changed to ",
 )
+
+# Title state file — tracks when we last updated, so we don't spam the LLM
+_TITLE_STATE_PATH = os.path.expanduser("~/.hermes/data/title_update_counts.json")
 
 
 def _title_config() -> dict:
@@ -209,6 +212,125 @@ def start_title_upgrade(upgrade: Optional[threading.Thread]) -> None:
         return
     _UPGRADE_THREADS.add(upgrade)
     upgrade.start()
+
+
+# === Auto-update title functions (jun-agent fork feature) ===
+
+def _load_title_state() -> dict:
+    """Load title update tracking state from disk."""
+    try:
+        with open(_TITLE_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_title_state(state: dict) -> None:
+    """Persist title update tracking state to disk."""
+    os.makedirs(os.path.dirname(_TITLE_STATE_PATH), exist_ok=True)
+    with open(_TITLE_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
+def _mark_updated(session_id: str, total_user_msgs: int) -> None:
+    """Record the current user-message count as the last-update point."""
+    state = _load_title_state()
+    state[session_id] = total_user_msgs
+    _save_title_state(state)
+
+
+def _should_update_title(session_id: str, current_count: int, interval: int) -> bool:
+    """Check whether enough new messages have accumulated since last title update.
+
+    Reads the stored count for this session and compares against current_count.
+    Only returns True if at least `interval` new user messages have appeared
+    since the last update.
+    """
+    state = _load_title_state()
+    last_count = state.get(session_id, 0)
+    if last_count == 0:
+        return True
+    return (current_count - last_count) >= interval
+
+
+def generate_title_from_history(
+    conversation_history: list,
+    timeout: float = 30.0,
+    failure_callback: Optional[FailureCallback] = None,
+    main_runtime: dict = None,
+) -> Optional[str]:
+    """Generate a session title from recent conversation history.
+
+    Uses the last N user/assistant exchanges (default: last 6 messages) to
+    produce a title reflecting the current topic. Falls back to the full
+    exchange if history is too short.
+    """
+    # Grab last N messages for context
+    recent = list(conversation_history[-12:]) if conversation_history else []
+
+    # Build a prompt from the recent messages
+    messages = []
+    system_language = _title_language()
+    prompt = (
+        _TITLE_PROMPT_TEMPLATE.replace("__LANGUAGE_RULE__",
+            _LANGUAGE_RULE_PINNED.format(language=system_language) if system_language
+            else _LANGUAGE_RULE_MATCH_USER)
+    )
+    messages.append({"role": "system", "content": prompt})
+
+    # Format recent exchanges for the LLM
+    context_parts = []
+    for msg in recent:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            context_parts.append(f"{role}: {content}")
+        elif isinstance(content, list):
+            # Handle multimodal content — extract text parts
+            text_parts = [
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            text = "\n".join(text_parts)
+            context_parts.append(f"{role}: {text}")
+        else:
+            context_parts.append(f"{role}: [non-text content]")
+
+    user_snippet = "\n".join(context_parts)[-2000:] if context_parts else ""
+
+    messages.append({"role": "user", "content": user_snippet})
+
+    try:
+        response = call_llm(
+            task="title_generation",
+            messages=messages,
+            max_tokens=500,
+            temperature=0.3,
+            timeout=timeout,
+            main_runtime=main_runtime,
+        )
+        title = (response.choices[0].message.content or "").strip()
+        # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
+        title = title.strip('"\'')
+        if title.lower().startswith("title:"):
+            title = title[6:].strip()
+        # Enforce reasonable length
+        if len(title) > 80:
+            title = title[:77] + "..."
+        return title if title else None
+    except Exception as e:
+        logger.warning("Title generation from history failed: %s", e)
+        logger.debug("Title generation traceback", exc_info=True)
+        if failure_callback is not None:
+            try:
+                failure_callback("title generation", e)
+            except Exception:
+                logger.debug("Title generation failure_callback raised", exc_info=True)
+        return None
+
+
+# === End auto-update title functions ===
 
 
 def strip_control_wrappers(text: str) -> str:
@@ -562,53 +684,93 @@ def auto_title_session(
     session_db,
     session_id: str,
     user_message: str,
+    conversation_history: list,
+    interval: int = 10,
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
     runtime_validator: Optional[RuntimeValidator] = None,
     title_preview: str | None = None,
 ) -> None:
-    """Generate and store the model title (daemon-thread target); skips sessions already carrying an
-    ``llm``/``user`` title (a ``derived`` one is expected — upgrading it is the point). Never lets an
-    exception escape (the threading excepthook would spray a traceback into the terminal); the canonical
-    trigger is the post-``hermes update`` window where lazy imports read NEW source against OLD modules."""
+    """Generate or update a session title.
+
+    On the first exchange (no title yet): generates a title from the initial
+    user→assistant pair. On subsequent calls, checks if enough new messages have
+    accumulated — if so, regenerates the title from recent history.
+
+    Called in a background thread after each response completes.
+    """
+    if not session_db or not session_id:
+        return
+
+    # Count user messages in history
+    user_msg_count = sum(
+        1 for m in (conversation_history or []) if _is_real_user_turn(m)
+    )
+
+    # Check if title already exists
+    existing_source = None
+    existing_title = None
     try:
-        if not session_db or not session_id or _has_upgraded_title(session_db, session_id):
+        source_fn = getattr(session_db, "get_session_title_source", None)
+        if source_fn is not None:
+            existing_source = source_fn(session_id)
+    except Exception:
+        pass
+    try:
+        if existing_source is None or existing_source == "derived":
+            if callable(session_db.get_session_title):
+                existing_title = session_db.get_session_title(session_id)
+    except Exception:
+        pass
+
+    if existing_title and existing_source and existing_source != "derived":
+        # Title exists at llm/user level — check if we should update it
+        if not _should_update_title(session_id, user_msg_count, interval):
             return
-        # This thread starts AFTER the turn's ambient context was reset; republish it so the call carries
-        # the same Portal ``conversation=`` tag (root-of-lineage) and bills usage to this session.
-        from agent.aux_accounting import set_accounting_context
-        from agent.portal_tags import set_conversation_context
-        conversation_id = session_id
-        with suppress(Exception):
-            conversation_id = session_db.get_conversation_root(session_id) or session_id
-        set_conversation_context(conversation_id)
-        # Same for the accounting context, so the title call's token usage is recorded against this session
-        # (task='title_generation', #23270).
-        set_accounting_context(session_db, session_id)
-        title, source = generate_title(
-            user_message, failure_callback=failure_callback, main_runtime=main_runtime,
-            runtime_validator=runtime_validator, title_preview=title_preview,
-        ), "llm"
-        if title and _is_provisional_greeting_title(title):
-            source = "derived"
-        if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
-            title, source = derive_title(user_message, title_preview), "derived"
+        # Enough messages accumulated — regenerate from history
+        title = generate_title_from_history(
+            conversation_history,
+            failure_callback=failure_callback,
+            main_runtime=main_runtime,
+        )
         if not title:
             return
         try:
-            persisted = _persist_session_title(session_db, session_id, title, source=source)
+            session_db.set_session_title(session_id, title)
+            logger.debug("Updated session title: %s (session: %s)", title, session_id)
+            if title_callback is not None:
+                try:
+                    title_callback(title, "llm")
+                except Exception:
+                    logger.debug("Auto-title callback failed", exc_info=True)
+        except Exception as e:
+            logger.debug("Failed to set updated title: %s", e)
+    else:
+        # No title yet — generate from first exchange
+        title = generate_title(
+            user_message,
+            timeout=None,
+            failure_callback=failure_callback,
+            main_runtime=main_runtime,
+            runtime_validator=runtime_validator,
+            title_preview=title_preview,
+        )
+        if not title:
+            return
+        try:
+            session_db.set_session_title(session_id, title)
+            logger.debug("Auto-generated session title: %s", title)
+            if title_callback is not None:
+                try:
+                    title_callback(title, "llm")
+                except Exception:
+                    logger.debug("Auto-title callback failed", exc_info=True)
         except Exception as e:
             logger.debug("Failed to set auto-generated title: %s", e)
-            return
-        if persisted is not None:
-            logger.debug("Auto-generated session title: %s", persisted)
-            _notify_title(title_callback, persisted, source, "Auto-title")
-    except Exception as e:
-        # WARNING so operators see it in agent.log; names the likely cause.
-        logger.warning("Auto-title failed (harmless; if this started after an update, restart the running Hermes process): %s", e)
-        logger.debug("Auto-title traceback", exc_info=True)
-        _report_failure(failure_callback, e, "Auto-title")
+
+    # Mark that we've updated this session's title
+    _mark_updated(session_id, user_msg_count)
 
 
 def _is_real_user_turn(message: Any) -> bool:
@@ -666,7 +828,8 @@ def maybe_auto_title(
     """Instant inline title, then a daemon-thread upgrade. Call at the START of a turn, before the model.
 
     Returns the upgrade thread: already started, or — when ``title_upgrade_must_wait_for_turn`` — left
-    UNSTARTED for the caller to hand to ``start_title_upgrade`` once the turn's model request settled."""
+    UNSTARTED for the caller to hand to ``start_title_upgrade`` once the turn's model request settled.
+    """
     if not session_db or not session_id or not user_message:
         return None
     # History may be pre- or post-message. Past the opening turn, skip once the session holds an
@@ -709,8 +872,8 @@ def maybe_auto_title(
         upgrade_kwargs["title_preview"] = title_preview
     upgrade = spawn_context_thread(
         auto_title_session, name="auto-title",
-        args=(session_db, session_id, user_message),
-        kwargs=upgrade_kwargs,
+        args=(session_db, session_id, user_message, conversation_history or []),
+        kwargs={**upgrade_kwargs, "interval": 10},
     )
     if title_upgrade_must_wait_for_turn(main_runtime):
         logger.debug("Auto-title upgrade deferred past the turn: shares the custom endpoint with the main request")

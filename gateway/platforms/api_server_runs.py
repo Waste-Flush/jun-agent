@@ -595,6 +595,10 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             sort_keys=True, separators=(",", ":"), ensure_ascii=False,
         ).encode()).hexdigest()
     raw_input = body.get("input")
+
+    # Allow caller to identify themselves for per-user memory isolation.
+    user_id = request.headers.get("X-Hermes-User-ID", "").strip() or \
+              (body.get("user_id") if isinstance(body.get("user_id"), str) else "") or None
     if not raw_input:
         return _json_error(_openai_error, "Missing 'input' field", status=400)
     if isinstance(raw_input, str):
@@ -681,6 +685,7 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         agent_kwargs=dict(
             ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
+            user_id=user_id,
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
