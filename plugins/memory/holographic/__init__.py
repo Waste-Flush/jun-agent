@@ -134,6 +134,7 @@ class HolographicMemoryProvider(MemoryProvider):
         if isinstance(db_path, str):  # expand $HERMES_HOME so paths resolve to the active profile
             db_path = db_path.replace("$HERMES_HOME", _hermes_home).replace("${HERMES_HOME}", _hermes_home)
         hrr_dim = int(self._config.get("hrr_dim", 1024))
+        self._user_id = kwargs.get("user_id")  # for scoped prefetch
         self._store = MemoryStore(db_path=db_path, default_trust=float(self._config.get("default_trust", 0.5)), hrr_dim=hrr_dim)
         self._retriever = FactRetriever(store=self._store, hrr_dim=hrr_dim, hrr_weight=float(self._config.get("hrr_weight", 0.3)),
                                         temporal_decay_half_life=int(self._config.get("temporal_decay_half_life", 0)))
@@ -157,7 +158,8 @@ class HolographicMemoryProvider(MemoryProvider):
         if not self._retriever or not query:
             return ""
         try:
-            results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
+            # Filter by owning user's facts when user_id is known; None = global (tool-level access)
+            results = self._retriever.search(query, min_trust=self._min_trust, limit=5, owner_id=self._user_id)
             lines = [f"- [{r.get('trust_score', r.get('trust', 0)):.1f}] {r.get('content', '')}" for r in results]
             return "## Holographic Memory\n" + "\n".join(lines) if results else ""
         except Exception as e:
