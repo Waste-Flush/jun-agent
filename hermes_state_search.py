@@ -161,9 +161,10 @@ def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_
 
 
 def _search_filter_clauses(
-    where: list[str], params: list, *, include_inactive: bool, source_filter: Optional[list[str]],
-    exclude_sources: Optional[list[str]], role_filter: Optional[list[str]],
-    after_ts: Optional[int] = None, before_ts: Optional[int] = None) -> None:
+    where: List[str], params: list, *, include_inactive: bool, source_filter: Optional[List[str]],
+    exclude_sources: Optional[List[str]], role_filter: Optional[List[str]],
+    after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+    user_id: Optional[str] = None) -> None:
     """Append the visibility/source/role/session-start predicates every search route shares. Live
     rows (active=1) AND compaction-archived rows (compacted=1) are discoverable; only
     rewind/undo rows (active=0, compacted=0) are hidden. ``after_ts``/``before_ts`` bound
@@ -188,6 +189,9 @@ def _search_filter_clauses(
     if before_ts is not None:
         where.append("s.started_at < ?")
         params.append(int(before_ts))
+    if user_id is not None:
+        where.append("s.user_id = ?")
+        params.append(user_id)
 
 
 class SessionSearchMixin:
@@ -1088,6 +1092,7 @@ class SessionSearchMixin:
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
         after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        user_id: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
         Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
@@ -1108,11 +1113,23 @@ class SessionSearchMixin:
         # New oversized tool results index only a bounded prefix; an explicit tool-role search is the
         # opt-in full-body path and scans canonical rows via LIKE.
         if role_filter and "tool" in role_filter:
-            matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+            matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort,
+                                                          include_inactive=include_inactive,
+                                                          source_filter=source_filter,
+                                                          exclude_sources=exclude_sources,
+                                                          role_filter=role_filter,
+                                                          after_ts=after_ts, before_ts=before_ts,
+                                                          user_id=user_id)
             return self._finalize_search_matches(matches, result_fields=result_fields)
         self._refresh_fts_stale_state()
         if self._fts_stale:
-            matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort, **filters)
+            matches = self._search_messages_like_fallback(query, limit=limit, offset=offset, sort=sort,
+                                                          include_inactive=include_inactive,
+                                                          source_filter=source_filter,
+                                                          exclude_sources=exclude_sources,
+                                                          role_filter=role_filter,
+                                                          after_ts=after_ts, before_ts=before_ts,
+                                                          user_id=user_id)
             return self._finalize_search_matches(matches, result_fields=result_fields)
         if not self._fts_enabled:
             return []
