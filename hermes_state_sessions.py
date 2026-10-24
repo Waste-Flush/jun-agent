@@ -128,6 +128,41 @@ def _session_filter_where(
     return where, params
 
 
+def _expand_compression_lineage_ids(conn, frontier: list[str]) -> list[str]:
+    """One both-direction compression-edge step from *frontier*: forward through every
+    continuation child and backward through the compression parent, using the SAME edge
+    definition as ``_CHAIN_STEP_SQL`` / the list-projection CTE (parent ended with
+    ``reason='compression'``, child is not a branch / reset / delegate / tool session).
+    Branch/reset children are NOT continuations — they are their own conversations."""
+    ids = [sid for sid in frontier if sid]
+    if not ids:
+        return []
+    out: list[str] = []
+    for chunk in _id_chunks(ids, _SQL_IN_CHUNK // 4):  # each id bound 4x below
+        ph = _session_ids_placeholders(chunk)
+        child_filter = (
+            f"{_sql_json_extract('child.model_config', '$._branched_from')} IS NULL "
+            f"AND {_sql_json_extract('child.model_config', '$._delegate_from')} IS NULL "
+            f"AND NOT ({_RESET_CHILD_SQL.format(a='child')}) "
+            "AND COALESCE(child.source, '') != 'tool'"
+        )
+        out.extend(row["id"] for row in conn.execute(
+            # forward: every continuation of a compression-ended frontier row
+            f"SELECT child.id FROM sessions parent "
+            f"JOIN sessions child ON child.parent_session_id = parent.id "
+            f"WHERE parent.id IN ({ph}) AND parent.end_reason = 'compression' AND {child_filter}",
+            chunk,
+        ).fetchall())
+        out.extend(row["id"] for row in conn.execute(
+            # backward: the compression parent of a frontier row
+            f"SELECT parent.id FROM sessions child "
+            f"JOIN sessions parent ON parent.id = child.parent_session_id "
+            f"WHERE child.id IN ({ph}) AND parent.end_reason = 'compression' "
+            f"AND {child_filter}",
+        ).fetchall())
+    return out
+
+
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     """Delegate-subagent ids (``_delegate_from`` marker, walked recursively) to cascade-delete with
     *parent_ids*; untagged children stay orphaned, not deleted."""
